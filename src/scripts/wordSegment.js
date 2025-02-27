@@ -2,6 +2,8 @@ const fs = require('fs');
 const nodejieba = require('nodejieba');
 const { MongoClient } = require('mongodb');
 const crypto = require('crypto');
+const path = require('path');
+const csv = require('csv-parser');
 
 // 生成 GUID
 function generateGUID() {
@@ -14,95 +16,85 @@ const dbName = 'chamcham';
 const wordSegmentsCollection = 'word_segments';
 const articlesCollection = 'articles';
 
-// 读取文件内容
-const content = fs.readFileSync('1849720980.txt', 'utf-8');
+const dataDir = 'data';
 
-// 初始化词-文章ID映射
-const wordArticleMap = new Map();
-
-// 存储文章内容的数组
-const articles = [];
-
-// 处理文本内容
-let currentArticleNum = 1;
-let isContent = false;
-let currentContent = [];
-let foundFirstTool = false;
-let currentPublishTime = '';
-
-// 按行分割内容
-const lines = content.split('\n');
-
-// 遍历每一行
-for (let line of lines) {
-  line = line.trim();
-  
-  // 记录发布时间
-  if (line.startsWith('发布时间：')) {
-    currentPublishTime = line.substring('发布时间：'.length).trim();
-    continue;
-  }
-  
-  // 检查是否是需要跳过的行
-  if (line.startsWith('微博位置：') ||
-      line.startsWith('点赞数：') ||
-      line.startsWith('转发数：') ||
-      line.startsWith('评论数：')) {
-    continue;
-  }
-  
-  // 检查是否是文章分隔符
-  if (line.startsWith('发布工具：')) {
-    foundFirstTool = true;
-    // 处理当前文章的所有内容
-    if (currentContent.length > 0) {
-      // 在 '答：' 前添加换行符
-      const text = currentContent.join('\n').replace(/(答：)/g, '\n$1');
-      
-      // 创建文章对象，使用 GUID 作为 ID，并添加发布时间
-      articles.push({
-        _id: generateGUID(),
-        articleNum: currentArticleNum,
-        content: text + '\n\n发布时间：' + currentPublishTime,
-        publishTime: currentPublishTime,
-        createdAt: new Date()
-      });
-      
-      // 重置并准备处理下一篇文章
-      currentArticleNum++;
-      currentContent = [];
-      currentPublishTime = '';
-    }
-    isContent = false;
-    continue;
-  }
-  
-  // 如果找到空行，且已经遇到过发布工具，开始收集新文章
-  if (foundFirstTool && line === '') {
-    isContent = true;
-    continue;
-  }
-  
-  // 如果是文章内容，添加到当前内容数组
-  if (isContent && line && !line.includes('原创微博内容：')) {
-    currentContent.push(line);
-  }
-}
-
-// 处理最后一篇文章（如果有）
-if (currentContent.length > 0) {
-  const text = currentContent.join('\n').replace(/(答：)/g, '\n$1');
-  articles.push({
-    _id: generateGUID(),
-    articleNum: currentArticleNum,
-    content: text + '\n\n发布时间：' + currentPublishTime,
-    publishTime: currentPublishTime,
-    createdAt: new Date()
+// 读取CSV文件
+function readCSV(filePath) {
+  return new Promise((resolve, reject) => {
+    const results = [];
+    fs.createReadStream(filePath)
+      .pipe(csv())
+      .on('data', (data) => results.push(data))
+      .on('end', () => resolve(results))
+      .on('error', (err) => reject(err));
   });
 }
 
-// 存储到MongoDB
-async function saveToMongoDB() {
+// 读取TXT文件
+function readTXT(filePath) {
+  return fs.readFileSync(filePath, 'utf-8');
+}
+
+// 存储文章内容的数组
+const savedArticles = [];
+
+// 读取data文件夹中的所有txt文件
+const txtFiles = fs.readdirSync(dataDir).filter(file => file.endsWith('.txt'));
+
+// 遍历每个txt文件并分析内容
+txtFiles.forEach(async (txtFile) => {
+  const txtFilePath = path.join(dataDir, txtFile);
+  const csvFilePath = path.join(dataDir, txtFile.replace('.txt', '.csv'));
+
+  // 读取CSV文件
+  const csvData = await readCSV(csvFilePath);
+  const txtContent = readTXT(txtFilePath);
+
+  // 找到"原创微博内容："的位置
+  const startIndex = txtContent.indexOf('原创微博内容：');
+  if (startIndex === -1) return; // 如果没有找到，跳过该文件
+
+  // 提取文章内容
+  const contentAfterOriginal = txtContent.substring(startIndex + '原创微博内容：'.length);
+  const articles = contentAfterOriginal.split(/发布工具：.*\n/).map(article => article.trim());
+
+  articles.forEach(article => {
+    // 去除末尾的几行信息
+    const lines = article.split('\n');
+    const filteredLines = lines.filter(line => 
+      !line.startsWith('微博位置：') &&
+      !line.startsWith('发布时间：') &&
+      !line.startsWith('点赞数：') &&
+      !line.startsWith('转发数：') &&
+      !line.startsWith('评论数：') &&
+      !line.startsWith('发布工具：')
+    );
+    const cleanedArticle = filteredLines.join('\n');
+
+    const first10Chars = cleanedArticle.slice(0, 10);
+
+    csvData.forEach(row => {
+      if (row["微博正文"].startsWith(first10Chars)) {
+        const articleID = row['微博id']; // 通过索引访问"微博ID"
+        const currentPublishTime = row['发布时间'];
+
+        // 存储匹配结果
+        console.log(`匹配成功：文章ID ${articleID} 对应的文章内容已存储。`);
+        
+        // 创建文章对象，使用微博ID作为文章ID
+        savedArticles.push({
+          _id: articleID,
+          content: cleanedArticle,
+          publishTime: currentPublishTime,
+          createdAt: new Date()
+        });
+      }
+    });
+  });
+});
+
+// 存储文章和分词到MongoDB
+async function storeArticlesAndSegments() {
   const client = new MongoClient(url);
   
   try {
@@ -110,52 +102,43 @@ async function saveToMongoDB() {
     console.log('Connected to MongoDB');
     
     const db = client.db(dbName);
-    const wordSegmentsCol = db.collection(wordSegmentsCollection);
     const articlesCol = db.collection(articlesCollection);
+    const wordSegmentsCol = db.collection(wordSegmentsCollection);
     
     // 清空已有数据
-    await wordSegmentsCol.deleteMany({});
     await articlesCol.deleteMany({});
+    await wordSegmentsCol.deleteMany({});
     console.log('Cleared existing data');
     
     // 存储文章内容
-    const result = await articlesCol.insertMany(articles);
-    console.log(`Inserted ${result.insertedCount} articles`);
-    
-    // 处理分词
-    const wordSegments = [];
-    for (const article of articles) {
-      const words = nodejieba.cut(article.content);
+    for (const article of savedArticles) {
+      // 检查是否已经存在相同的文章ID
+      const existingArticle = await articlesCol.findOne({ _id: article._id });
+      if (existingArticle) {
+        console.log(`跳过存储：文章ID ${article._id} 已存在。`);
+        continue; // 跳过存储
+      }
       
-      words.forEach(word => {
-        if (word.trim() && !/^\s+$/.test(word)) {
-          if (!wordArticleMap.has(word)) {
-            wordArticleMap.set(word, new Set());
-          }
-          wordArticleMap.get(word).add(article._id);
-        }
-      });
+      // 插入文章
+      await articlesCol.insertOne(article);
+      console.log(`存储成功：文章ID ${article._id}`);
     }
     
-    // 转换为MongoDB文档格式
-    for (const [word, articleIds] of wordArticleMap) {
-      wordSegments.push({
-        word: word,
-        articleIds: Array.from(articleIds),
-        createdAt: new Date()
-      });
+    // 遍历每篇文章进行分词
+    for (const article of savedArticles) {
+      const words = nodejieba.cut(article.content);
+      const uniqueWords = new Set(words);
+
+      for (const word of uniqueWords) {
+        await wordSegmentsCol.updateOne(
+          { word: word },
+          { $addToSet: { articleIds: article._id } },
+          { upsert: true }
+        );
+      }
     }
     
-    // 插入分词数据
-    const segmentResult = await wordSegmentsCol.insertMany(wordSegments);
-    console.log(`Inserted ${segmentResult.insertedCount} word segments`);
-    
-    // 创建索引
-    await wordSegmentsCol.createIndex({ word: 1 });
-    await articlesCol.createIndex({ articleNum: 1 });
-    await articlesCol.createIndex({ _id: 1 });
-    await articlesCol.createIndex({ publishTime: 1 });
-    console.log('Created indexes');
+    console.log('Word segments stored successfully');
     
   } catch (err) {
     console.error('Error:', err);
@@ -166,4 +149,4 @@ async function saveToMongoDB() {
 }
 
 // 执行存储操作
-saveToMongoDB().catch(console.error); 
+storeArticlesAndSegments().catch(console.error);

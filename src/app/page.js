@@ -41,7 +41,15 @@ function highlightText(text, keywords) {
               {part}
             </span>
           ) : (
-            part
+            part.includes('答：') ? (
+              <>
+                {part.split('答：').map((subPart, j) => (
+                  j > 0 ? <><br />答：{subPart}</> : subPart
+                ))}
+              </>
+            ) : (
+              part
+            )
           );
         })}
         <br />
@@ -101,7 +109,7 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <div className="space-y-2">
+                    <div className="space-y-2 whitespace-pre-wrap text-sm text-gray-300 mb-3 leading-relaxed">
                       {highlightText(article.content, keywords)}
                     </div>
                   </div>
